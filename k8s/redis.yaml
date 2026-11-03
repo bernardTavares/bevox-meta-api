@@ -1,0 +1,74 @@
+# Redis 7-alpine StatefulSet com AOF (append-only file) pra durabilidade.
+# Single replica V1 (sentinel/cluster fica pra V2 quando HA importar).
+#
+# Pré-requisito: Secret `redis-secret` com REDIS_PASSWORD aleatório:
+#   kubectl create secret generic redis-secret -n bevox-meta-api \
+#     --from-literal=REDIS_PASSWORD="$(openssl rand -hex 32)"
+#
+# REDIS_URL injetado no bevox-meta-api-secret (composto no runtime, não aqui).
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: bevox-meta-api
+  labels: { app: redis }
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command:
+            - sh
+            - -c
+            - exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: redis-secret, key: REDIS_PASSWORD }
+          ports:
+            - { containerPort: 6379, name: redis }
+          livenessProbe:
+            exec: { command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"] }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            exec: { command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"] }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            readOnlyRootFilesystem: true
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: bevox-meta-api
+spec:
+  clusterIP: None # headless — StatefulSet usa DNS por-pod
+  selector: { app: redis }
+  ports:
+    - { name: redis, port: 6379, targetPort: 6379 }

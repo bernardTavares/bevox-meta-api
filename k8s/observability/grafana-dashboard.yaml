@@ -1,0 +1,38 @@
+# Dashboard pro Grafana via sidecar auto-import (label grafana_dashboard=1).
+# Painéis derivados de §4 do plano go-live: HTTP latency, Meta latency,
+# Queue depth, Webhook delivery success.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bevox-meta-api-dashboard
+  namespace: monitoring
+  labels: { grafana_dashboard: "1" }
+data:
+  bevox-meta-api.json: |
+    {
+      "title": "bevox-meta-api",
+      "uid": "bevox-meta-api",
+      "timezone": "utc",
+      "schemaVersion": 39,
+      "panels": [
+        { "id": 1, "title": "HTTP latency p95/p99", "type": "timeseries", "gridPos": {"h":8,"w":12,"x":0,"y":0},
+          "targets": [
+            {"expr":"histogram_quantile(0.95, sum by (le) (rate(bevox_meta_api_http_request_duration_seconds_bucket[5m])))","legendFormat":"p95"},
+            {"expr":"histogram_quantile(0.99, sum by (le) (rate(bevox_meta_api_http_request_duration_seconds_bucket[5m])))","legendFormat":"p99"}
+          ]},
+        { "id": 2, "title": "Meta latency p95/p99", "type": "timeseries", "gridPos": {"h":8,"w":12,"x":12,"y":0},
+          "targets": [
+            {"expr":"histogram_quantile(0.95, sum by (le) (rate(bevox_meta_api_meta_request_duration_seconds_bucket[5m])))","legendFormat":"p95"},
+            {"expr":"histogram_quantile(0.99, sum by (le) (rate(bevox_meta_api_meta_request_duration_seconds_bucket[5m])))","legendFormat":"p99"}
+          ]},
+        { "id": 3, "title": "Queue depth", "type": "timeseries", "gridPos": {"h":8,"w":12,"x":0,"y":8},
+          "targets": [{"expr":"bevox_meta_api_queue_size","legendFormat":"{{queue}}"}]},
+        { "id": 4, "title": "Webhook delivery success rate", "type": "timeseries", "gridPos": {"h":8,"w":12,"x":12,"y":8},
+          "targets": [{"expr":"sum(rate(bevox_meta_api_webhook_delivery_total{outcome=\"delivered\"}[5m])) / clamp_min(sum(rate(bevox_meta_api_webhook_delivery_total[5m])),1)","legendFormat":"success"}]},
+        { "id": 5, "title": "Token refresh outcomes", "type": "timeseries", "gridPos": {"h":8,"w":12,"x":0,"y":16},
+          "targets": [{"expr":"sum by (outcome) (rate(bevox_meta_api_token_refresh_total[15m]))","legendFormat":"{{outcome}}"}]},
+        { "id": 6, "title": "Cleanup activity", "type": "timeseries", "gridPos": {"h":8,"w":12,"x":12,"y":16},
+          "targets": [{"expr":"sum by (table) (increase(bevox_meta_api_cleanup_deleted_total[1h]))","legendFormat":"{{table}}"}]}
+      ]
+    }

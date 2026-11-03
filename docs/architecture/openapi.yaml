@@ -1,0 +1,1328 @@
+openapi: 3.1.0
+info:
+  title: bevox-meta-api
+  version: 1.2.0
+  description: |
+    API HTTP unificada de integração com a Meta (WhatsApp Business + Instagram).
+    Consumida exclusivamente por produtos internos da família Bevox.
+
+    **Scope:** multi-app, multi-tenant. Cada `consumer_app` opera N tenants;
+    cada tenant traz seu próprio WABA / Instagram via OAuth Meta.
+
+    **Auth:** JWT RS256 assinado pelo consumer app, verificado com chave
+    pública registrada na meta-api. `kid` no header identifica a chave.
+    Vida do JWT ≤ 5 minutos.
+
+    **Idempotência:** todas mutações exigem header `Idempotency-Key`.
+
+    **Versionamento:** path-based (`/v1/...`). Breaking changes só em nova major.
+
+    Para detalhes operacionais, ver PRD `bevox-meta-api-prd-v1.md`.
+  contact:
+    name: Bevox engineering
+    email: maintainer@example.com
+  license:
+    name: Internal — proprietary
+servers:
+  - url: https://meta-api.internal.example.com
+    description: Production (interno cluster)
+  - url: https://meta-api.staging.internal.example.com
+    description: Staging
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: tenants
+    description: CRUD de tenants do app consumidor
+  - name: wabas
+    description: WhatsApp Business Accounts (OAuth + binding)
+  - name: phone-numbers
+    description: Números WhatsApp dentro de uma WABA
+  - name: ig-accounts
+    description: Instagram Business accounts
+  - name: templates
+    description: Templates WhatsApp Business (criar, submeter, listar)
+  - name: messages
+    description: Envio outbound síncrono e assíncrono
+  - name: events
+    description: Recepção inbound — SSE stream e polling
+  - name: webhooks
+    description: Subscriptions de webhook push
+  - name: admin
+    description: Operações administrativas (admin only)
+  - name: health
+    description: Liveness e readiness
+
+security:
+  - consumerJWT: []
+
+paths:
+  # ----------------------------------------------------------------------------
+  # Tenants
+  # ----------------------------------------------------------------------------
+  /v1/tenants:
+    post:
+      tags: [tenants]
+      summary: Criar tenant
+      operationId: createTenant
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TenantCreate"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/IdempotencyConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    get:
+      tags: [tenants]
+      summary: Listar tenants do app consumidor
+      operationId: listTenants
+      parameters:
+        - name: external_id
+          in: query
+          schema: { type: string }
+          description: Filtra por external_id (lookup)
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedTenants"
+
+  /v1/tenants/{tenant_id}:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+    get:
+      tags: [tenants]
+      summary: Detalhe do tenant
+      operationId: getTenant
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [tenants]
+      summary: Atualizar metadata
+      operationId: updateTenant
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TenantUpdate" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+    delete:
+      tags: [tenants]
+      summary: Soft-delete (rejeita se houver WABAs ativos)
+      operationId: deleteTenant
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Deleted
+        "409":
+          description: Conflict — tenant tem WABAs/IGs ativos
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ----------------------------------------------------------------------------
+  # WABA enrollment
+  # ----------------------------------------------------------------------------
+  /v1/tenants/{tenant_id}/wabas/connect/init:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+    post:
+      tags: [wabas]
+      summary: Iniciar OAuth Meta para conectar uma WABA
+      operationId: initWabaConnect
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                redirect_url:
+                  type: string
+                  format: uri
+                  description: URL para a qual a meta-api redirecionará após callback
+              required: [redirect_url]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  oauth_url: { type: string, format: uri }
+                  state: { type: string }
+                  config_id:
+                    type: string
+                    description: Embedded Signup config_id (presente se META_ES_CONFIG_ID setado). Front roda FB.login com ele.
+                  meta_app_id:
+                    type: string
+                    description: Meta App ID publico. Front usa em FB.init com appId.
+                  graph_version:
+                    type: string
+                    description: Versao do Graph API, por exemplo v21.0. Front usa em FB.init com version.
+                required: [oauth_url, state]
+
+  /v1/tenants/{tenant_id}/wabas/connect/complete:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+    post:
+      tags: [wabas]
+      summary: Completar Embedded Signup (POST do code vindo do widget)
+      operationId: completeWabaEmbeddedSignup
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+                waba_id: { type: string }
+                phone_number_id: { type: string }
+                business_id:
+                  type: string
+                  description: business_id do session info do widget. Fallback para o owner da WABA quando o GET da WABA nao traz owner/on_behalf_of business.
+                coexistence:
+                  type: boolean
+                  default: false
+                  description: COEX. Quando true, phone_number_id e obrigatorio; o numero e confirmado via is_on_biz_app e platform_type e o sync de 24h smb_app_data e disparado.
+      responses:
+        "200":
+          description: WABA conectada
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WabaConnection" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/IdempotencyConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/tenants/{tenant_id}/wabas/connect/callback:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+    get:
+      tags: [wabas]
+      summary: Callback OAuth (chamado pela Meta)
+      operationId: wabaConnectCallback
+      security: [] # não autenticado por JWT do consumer; valida state
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "302":
+          description: Redirect para `redirect_url` informada em init
+
+  /v1/tenants/{tenant_id}/wabas:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+    get:
+      tags: [wabas]
+      summary: Listar WABAs do tenant
+      operationId: listWabas
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/WabaConnection" }
+
+  /v1/tenants/{tenant_id}/wabas/{waba_id}:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+      - $ref: "#/components/parameters/WabaIdPath"
+    delete:
+      tags: [wabas]
+      summary: Desconectar WABA
+      operationId: deleteWaba
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Disconnected
+
+  # ----------------------------------------------------------------------------
+  # Phone numbers (WhatsApp)
+  # ----------------------------------------------------------------------------
+  /v1/tenants/{tenant_id}/wabas/{waba_id}/phone-numbers:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+      - $ref: "#/components/parameters/WabaIdPath"
+    get:
+      tags: [phone-numbers]
+      summary: Listar phone numbers da WABA
+      operationId: listPhoneNumbers
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/PhoneNumber" }
+
+  /v1/tenants/{tenant_id}/wabas/{waba_id}/phone-numbers/{phone_id}/profile:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+      - $ref: "#/components/parameters/WabaIdPath"
+      - name: phone_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [phone-numbers]
+      summary: Atualizar perfil de exibição
+      operationId: updatePhoneProfile
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PhoneProfileUpdate" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PhoneNumber" }
+
+  # ----------------------------------------------------------------------------
+  # Instagram accounts
+  # ----------------------------------------------------------------------------
+  /v1/tenants/{tenant_id}/ig-accounts/connect/init:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+    post:
+      tags: [ig-accounts]
+      summary: Iniciar OAuth Meta (IG) para conectar conta Instagram Business
+      operationId: initIgConnect
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                redirect_url: { type: string, format: uri }
+              required: [redirect_url]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  oauth_url: { type: string, format: uri }
+                  state: { type: string }
+
+  # A14 fix (audit 2026-06-02): callback OAuth IG estava implementado em
+  # src/modules/ig/routes.ts mas NÃO declarado aqui — clients gerados a
+  # partir da spec não tinham conhecimento da URL, dificultando integração
+  # e debug.
+  /v1/oauth/ig/callback:
+    get:
+      tags: [ig-accounts]
+      summary: Callback OAuth IG (chamado pela Meta)
+      operationId: igOauthCallback
+      security: [] # não autenticado por JWT do consumer; valida `state`
+      parameters:
+        - name: code
+          in: query
+          required: false
+          schema: { type: string }
+          description: Authorization code da Meta (presente em sucesso)
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+        - name: error
+          in: query
+          required: false
+          schema: { type: string }
+          description: Código de erro Meta (presente em falha)
+        - name: error_description
+          in: query
+          required: false
+          schema: { type: string }
+          description: Descrição human-readable do erro (presente em falha)
+        - name: error_reason
+          in: query
+          required: false
+          schema: { type: string }
+          description: Razão Meta para o erro (ex `user_denied`); aceito mas não obrigatório
+      responses:
+        "302":
+          description: Redirect para `redirect_url` informada em init (success=true|false)
+        "400":
+          description: state inválido ou expirado
+
+  /v1/tenants/{tenant_id}/ig-accounts:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+    get:
+      tags: [ig-accounts]
+      summary: Listar IG accounts do tenant
+      operationId: listIgAccounts
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/IgConnection" }
+
+  /v1/tenants/{tenant_id}/ig-accounts/{ig_id}:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+      - name: ig_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [ig-accounts]
+      summary: Desconectar IG account
+      operationId: deleteIgAccount
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Disconnected
+
+  # ----------------------------------------------------------------------------
+  # Templates WhatsApp
+  # ----------------------------------------------------------------------------
+  /v1/tenants/{tenant_id}/wabas/{waba_id}/templates:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+      - $ref: "#/components/parameters/WabaIdPath"
+    post:
+      tags: [templates]
+      summary: Criar template e submeter à aprovação Meta
+      operationId: createTemplate
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TemplateCreate" }
+      responses:
+        "202":
+          description: Submetido (status PENDING)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    get:
+      tags: [templates]
+      summary: Listar templates da WABA
+      operationId: listTemplates
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [PENDING, APPROVED, REJECTED, PAUSED, DISABLED]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Template" }
+
+  /v1/tenants/{tenant_id}/wabas/{waba_id}/templates/{name}/{language}:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+      - $ref: "#/components/parameters/WabaIdPath"
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+      - name: language
+        in: path
+        required: true
+        schema: { type: string, example: pt_BR }
+    get:
+      tags: [templates]
+      summary: Detalhe de template
+      operationId: getTemplate
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+    delete:
+      tags: [templates]
+      summary: Deletar template
+      operationId: deleteTemplate
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Deleted
+
+  /v1/tenants/{tenant_id}/wabas/{waba_id}/templates/{name}/{language}/resync:
+    parameters:
+      - $ref: "#/components/parameters/TenantIdPath"
+      - $ref: "#/components/parameters/WabaIdPath"
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+      - name: language
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [templates]
+      summary: Forçar re-leitura de status na Meta
+      operationId: resyncTemplate
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+
+  # ----------------------------------------------------------------------------
+  # Messages (outbound)
+  # ----------------------------------------------------------------------------
+  /v1/messages:
+    post:
+      tags: [messages]
+      summary: Envio síncrono
+      operationId: sendMessageSync
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MessageSendRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageSendResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/IdempotencyConflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502":
+          description: Meta upstream error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/messages/async:
+    post:
+      tags: [messages]
+      summary: Envio assíncrono (fila + callback)
+      operationId: sendMessageAsync
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/MessageSendRequest"
+                - type: object
+                  properties:
+                    callback_url: { type: string, format: uri }
+                    callback_secret: { type: string, description: HMAC secret para o callback }
+      responses:
+        "202":
+          description: Accepted (job enfileirado)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string, format: uuid }
+                  status: { type: string, enum: [queued] }
+
+  /v1/messages/{message_id}:
+    get:
+      tags: [messages]
+      summary: Detalhe de mensagem
+      operationId: getMessage
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - name: message_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageSendResult" }
+
+  /v1/jobs/{job_id}:
+    get:
+      tags: [messages]
+      summary: Status de job assíncrono
+      operationId: getJob
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OutboundJob" }
+
+  # ----------------------------------------------------------------------------
+  # Webhooks subscriptions
+  # ----------------------------------------------------------------------------
+  /v1/webhooks/subscriptions:
+    post:
+      tags: [webhooks]
+      summary: Registrar subscription de webhook (push) ou polling/SSE
+      operationId: createSubscription
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubscriptionCreate" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/WebhookSubscription"
+                  - type: object
+                    properties:
+                      secret:
+                        type: string
+                        description: HMAC secret entregue uma única vez (push only)
+    get:
+      tags: [webhooks]
+      summary: Listar subscriptions
+      operationId: listSubscriptions
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/WebhookSubscription" }
+
+  /v1/webhooks/subscriptions/{id}:
+    delete:
+      tags: [webhooks]
+      summary: Desregistrar subscription
+      operationId: deleteSubscription
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: Deleted
+
+  # ----------------------------------------------------------------------------
+  # Events (inbound delivery — SSE + polling)
+  # ----------------------------------------------------------------------------
+  /v1/events/stream:
+    get:
+      tags: [events]
+      summary: SSE stream de eventos (modo realtime)
+      operationId: eventsStream
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: Último event_id processado; reconexão usa cursor
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  event: message.received
+                  id: evt_01HW...
+                  data: {"tenant_id":"...","event_type":"message.received","data":{...}}
+
+  /v1/events:
+    get:
+      tags: [events]
+      summary: Polling de eventos (modo fallback)
+      operationId: pollEvents
+      parameters:
+        - name: since
+          in: query
+          schema: { type: string }
+          description: Cursor — último event_id processado
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/InboundEvent" }
+                  next_cursor: { type: string, nullable: true }
+
+  /v1/events/ack:
+    post:
+      tags: [events]
+      summary: Ack explícito de eventos consumidos
+      operationId: ackEvents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                event_ids:
+                  type: array
+                  items: { type: string }
+              required: [event_ids]
+      responses:
+        "204":
+          description: Acked
+
+  # ----------------------------------------------------------------------------
+  # Admin
+  # ----------------------------------------------------------------------------
+  /admin/apps:
+    post:
+      tags: [admin]
+      summary: Criar app consumidor
+      operationId: createApp
+      security:
+        - adminJWT: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: string }
+              required: [name]
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ConsumerApp"
+                  - type: object
+                    properties:
+                      private_key_pem:
+                        type: string
+                        description: Chave privada RSA — entregue uma única vez
+    get:
+      tags: [admin]
+      summary: Listar apps
+      operationId: listApps
+      security:
+        - adminJWT: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/ConsumerApp" }
+
+  /admin/apps/{app_id}/keys/rotate:
+    post:
+      tags: [admin]
+      summary: Gerar novo par de chaves para um app
+      operationId: rotateAppKey
+      security:
+        - adminJWT: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                grace_window_days: { type: integer, default: 14 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  new_kid: { type: string }
+                  private_key_pem: { type: string }
+
+  /admin/subscriptions/{id}/replay:
+    post:
+      tags: [admin]
+      summary: Replay de eventos em dead-letter
+      operationId: replaySubscription
+      security:
+        - adminJWT: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  properties:
+                    event_ids:
+                      type: array
+                      items: { type: string }
+                  required: [event_ids]
+                - type: object
+                  properties:
+                    since: { type: string, format: date-time }
+                    until: { type: string, format: date-time }
+                  required: [since]
+      responses:
+        "202":
+          description: Replay agendado
+
+  # ----------------------------------------------------------------------------
+  # Health
+  # ----------------------------------------------------------------------------
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness
+      operationId: healthz
+      security: []
+      responses:
+        "200":
+          description: Live
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, build]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  build:
+                    type: string
+                    description: |
+                      Git SHA curto do build em execução, injetado via
+                      `--build-arg BUILD_SHA=<sha>`. `"unknown"` quando
+                      o build não foi anotado (dev local, builds antigos).
+                    example: "2f625f4"
+  /readyz:
+    get:
+      tags: [health]
+      summary: Readiness (Postgres + Redis + KMS roundtrip)
+      operationId: readyz
+      security: []
+      responses:
+        "200":
+          description: Ready — todos os checks verdes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessReport'
+        "503":
+          description: Not ready — pelo menos um check vermelho.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessReport'
+
+# ==============================================================================
+# Components
+# ==============================================================================
+components:
+  securitySchemes:
+    consumerJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT RS256 assinado pelo consumer app com chave privada. Validado pela meta-api
+        com chave pública identificada por `kid`. Vida ≤ 5min. Claim `aud` = `bevox-meta-api`.
+        Ver MA-002.
+    adminJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "JWT admin (claim `role: admin`). Endpoints `/admin/*` somente."
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        maxLength: 128
+      description: |
+        Chave única por operação lógica. Mesmo key + mesmo body em janela 24h retorna
+        resposta cacheada. Mesmo key + body diferente retorna 422. Ver MA-006.
+    TenantId:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
+      description: ID do tenant scoped pela request.
+    TenantIdPath:
+      name: tenant_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    WabaIdPath:
+      name: waba_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Bad Request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not Found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    IdempotencyConflict:
+      description: Idempotency conflict — mesma key com payload diferente
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too Many Requests
+      headers:
+        X-RateLimit-Remaining: { schema: { type: integer } }
+        X-RateLimit-Reset: { schema: { type: integer, description: Unix timestamp } }
+        X-RateLimit-Scope: { schema: { type: string, enum: [app, tenant, waba] } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - UNAUTHENTICATED
+                - FORBIDDEN
+                - INVALID_INPUT
+                - NOT_FOUND
+                - CONFLICT
+                - IDEMPOTENCY_CONFLICT
+                - RATE_LIMITED
+                - META_UNAVAILABLE
+                - META_REJECTED
+                - INTERNAL
+            message: { type: string }
+            details: { type: object }
+            request_id: { type: string }
+
+    # --- Health
+    HealthCheckResult:
+      type: object
+      required: [ok, latencyMs]
+      properties:
+        ok: { type: boolean }
+        latencyMs: { type: integer, minimum: 0 }
+        error:
+          type: string
+          description: Mensagem do erro quando ok=false. Omitido quando ok=true.
+    ReadinessReport:
+      type: object
+      required: [ok, checks]
+      properties:
+        ok:
+          type: boolean
+          description: AND lógico dos subsystem checks. False derruba o probe para 503.
+        checks:
+          type: object
+          required: [postgres, redis, kms]
+          properties:
+            postgres: { $ref: '#/components/schemas/HealthCheckResult' }
+            redis: { $ref: '#/components/schemas/HealthCheckResult' }
+            kms: { $ref: '#/components/schemas/HealthCheckResult' }
+
+    # --- Tenants
+    TenantCreate:
+      type: object
+      properties:
+        external_id:
+          { type: string, description: Único por app. Útil para mapping ao domínio do consumer. }
+        display_name: { type: string }
+        metadata: { type: object, additionalProperties: true }
+
+    TenantUpdate:
+      type: object
+      properties:
+        display_name: { type: string }
+        metadata: { type: object, additionalProperties: true }
+
+    Tenant:
+      type: object
+      required: [id, app_id, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        app_id: { type: string, format: uuid }
+        external_id: { type: string, nullable: true }
+        display_name: { type: string, nullable: true }
+        metadata: { type: object, additionalProperties: true }
+        status: { type: string, enum: [active, disabled, deleted] }
+        created_at: { type: string, format: date-time }
+        deleted_at: { type: string, format: date-time, nullable: true }
+
+    PaginatedTenants:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Tenant" }
+        next_cursor: { type: string, nullable: true }
+
+    # --- WABAs
+    WabaConnection:
+      type: object
+      required: [id, tenant_id, meta_waba_id, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        meta_business_id: { type: string }
+        meta_waba_id: { type: string }
+        display_name: { type: string, nullable: true }
+        verified_status: { type: string, enum: [VERIFIED, UNVERIFIED, BANNED] }
+        created_at: { type: string, format: date-time }
+        disconnected_at: { type: string, format: date-time, nullable: true }
+
+    PhoneNumber:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        meta_phone_id: { type: string }
+        display_phone_number: { type: string }
+        verified_name: { type: string, nullable: true }
+        quality_rating: { type: string, enum: [GREEN, YELLOW, RED, UNKNOWN] }
+        messaging_limit_tier:
+          { type: string, enum: [TIER_50, TIER_250, TIER_1K, TIER_10K, TIER_100K, TIER_UNLIMITED] }
+
+    PhoneProfileUpdate:
+      type: object
+      properties:
+        about: { type: string, maxLength: 139 }
+        description: { type: string }
+        email: { type: string, format: email }
+        websites: { type: array, items: { type: string, format: uri } }
+        profile_picture_url: { type: string, format: uri }
+
+    # --- Instagram
+    IgConnection:
+      type: object
+      required: [id, tenant_id, meta_ig_id]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        meta_ig_id: { type: string }
+        username: { type: string }
+        account_type: { type: string, enum: [BUSINESS, CREATOR] }
+        created_at: { type: string, format: date-time }
+        disconnected_at: { type: string, format: date-time, nullable: true }
+
+    # --- Templates
+    TemplateCreate:
+      type: object
+      required: [name, language, category, components]
+      properties:
+        name: { type: string, pattern: "^[a-z0-9_]+$", maxLength: 512 }
+        language: { type: string, example: pt_BR }
+        category: { type: string, enum: [UTILITY, MARKETING, AUTHENTICATION] }
+        components:
+          type: array
+          items: { $ref: "#/components/schemas/TemplateComponent" }
+
+    TemplateComponent:
+      type: object
+      properties:
+        type: { type: string, enum: [HEADER, BODY, FOOTER, BUTTONS] }
+        format: { type: string, enum: [TEXT, IMAGE, VIDEO, DOCUMENT, LOCATION] }
+        text: { type: string }
+        example: { type: object, additionalProperties: true }
+        buttons:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [URL, QUICK_REPLY, PHONE_NUMBER, OTP] }
+              text: { type: string }
+              url: { type: string, format: uri }
+              phone_number: { type: string }
+
+    Template:
+      type: object
+      required: [name, language, category, status]
+      properties:
+        name: { type: string }
+        language: { type: string }
+        category: { type: string, enum: [UTILITY, MARKETING, AUTHENTICATION] }
+        components:
+          type: array
+          items: { $ref: "#/components/schemas/TemplateComponent" }
+        status: { type: string, enum: [PENDING, APPROVED, REJECTED, PAUSED, DISABLED] }
+        quality_score: { type: string, enum: [GREEN, YELLOW, RED, UNKNOWN], nullable: true }
+        created_at: { type: string, format: date-time }
+        last_synced_at: { type: string, format: date-time }
+
+    # --- Messages
+    MessageSendRequest:
+      type: object
+      required: [channel, to, type]
+      properties:
+        channel: { type: string, enum: [whatsapp, instagram] }
+        to: { type: string, description: WhatsApp E.164 ou IGSID conforme channel }
+        from_phone_number_id:
+          { type: string, description: WhatsApp phone_number_id (default = primário do WABA) }
+        type:
+          {
+            type: string,
+            enum: [text, template, image, document, audio, video, location, interactive],
+          }
+        text: { type: object, properties: { body: { type: string } } }
+        template:
+          type: object
+          properties:
+            name: { type: string }
+            language: { type: string }
+            components:
+              type: array
+              items: { type: object, additionalProperties: true }
+        media:
+          type: object
+          properties:
+            id: { type: string }
+            link: { type: string, format: uri }
+            caption: { type: string }
+            filename: { type: string }
+        interactive:
+          type: object
+          additionalProperties: true
+
+    MessageSendResult:
+      type: object
+      required: [message_id, status]
+      properties:
+        message_id: { type: string, format: uuid }
+        provider_message_id: { type: string, nullable: true }
+        status: { type: string, enum: [queued, sent, delivered, read, failed] }
+        error: { $ref: "#/components/schemas/Error", nullable: true }
+        sent_at: { type: string, format: date-time, nullable: true }
+
+    OutboundJob:
+      type: object
+      required: [id, status]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        idempotency_key: { type: string }
+        channel: { type: string, enum: [whatsapp, instagram] }
+        status: { type: string, enum: [queued, sending, sent, failed, expired] }
+        attempts: { type: integer }
+        last_error: { type: string, nullable: true }
+        provider_message_id: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time, nullable: true }
+
+    # --- Subscriptions / Events
+    SubscriptionCreate:
+      type: object
+      required: [delivery_mode]
+      properties:
+        delivery_mode: { type: string, enum: [push, sse, polling] }
+        url: { type: string, format: uri, description: Obrigatório se push }
+        tenant_id:
+          {
+            type: string,
+            format: uuid,
+            nullable: true,
+            description: null = todos os tenants do app,
+          }
+        event_types_filter:
+          type: array
+          items: { type: string }
+          example: [message.received, message.status_updated, template.status_updated]
+
+    WebhookSubscription:
+      type: object
+      required: [id, app_id, delivery_mode, status]
+      properties:
+        id: { type: string, format: uuid }
+        app_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        delivery_mode: { type: string, enum: [push, sse, polling] }
+        url: { type: string, format: uri, nullable: true }
+        event_types_filter:
+          type: array
+          items: { type: string }
+        status: { type: string, enum: [active, paused, disabled] }
+        created_at: { type: string, format: date-time }
+
+    InboundEvent:
+      type: object
+      required: [id, event_type, tenant_id, occurred_at]
+      properties:
+        id: { type: string, description: event_id estável; usado em ack e replay }
+        event_type:
+          type: string
+          enum:
+            - message.received
+            - message.status_updated
+            - template.status_updated
+            - waba.connection_changed
+            - phone_number.quality_changed
+            - whatsapp.message_echo
+            - whatsapp.contact_synced
+            - whatsapp.history_synced
+            - system.degraded
+            - system.recovered
+            - webhook.dead_letter
+        tenant_id: { type: string, format: uuid }
+        occurred_at: { type: string, format: date-time }
+        data: { type: object, additionalProperties: true }
+
+    # --- Apps
+    ConsumerApp:
+      type: object
+      required: [id, name, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        status: { type: string, enum: [active, deactivated] }
+        created_at: { type: string, format: date-time }
+        current_kid:
+          { type: string, nullable: true, description: kid da chave principal atualmente }

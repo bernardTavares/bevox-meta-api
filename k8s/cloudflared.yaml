@@ -1,0 +1,115 @@
+# Cloudflare Tunnel (cloudflared) — expõe meta-api.example.com publicamente sem
+# IP público / Ingress controller / cert-manager. CF termina TLS no edge.
+#
+# Pré-requisitos (fora do cluster, feitos no go-live 2026-05-27):
+#   1. `cloudflared tunnel create bevox-meta-api`
+#        → tunnel ID <TUNNEL_UUID>
+#        → credentials JSON em ~/.cloudflared/<TUNNEL_ID>.json
+#   2. CNAME meta-api.example.com → <TUNNEL_UUID>cfargotunnel.com
+#        (deletar CNAME conflitante existente antes; cloudflared CLI
+#         v2026.3.0 tem bug com --overwrite-dns + config.yml local interferindo)
+#   3. Secret cloudflared-credentials:
+#        kubectl create secret generic cloudflared-credentials \
+#          -n bevox-meta-api \
+#          --from-file=credentials.json=~/.cloudflared/<TUNNEL_ID>.json
+#
+# Observações:
+#   - cloudflared no mesmo ns (`bevox-meta-api`) simplifica NetworkPolicy.
+#   - 2 replicas + 4 conexões cada cobrem 4 PoPs Cloudflare diferentes (HA).
+#   - service: http_status:404 no fim é fallback obrigatório.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+  namespace: bevox-meta-api
+data:
+  config.yaml: |
+    tunnel: <TUNNEL_UUID>
+    credentials-file: /etc/cloudflared/creds/credentials.json
+    metrics: 0.0.0.0:2000
+    no-autoupdate: true
+    ingress:
+      - hostname: meta-api.example.com
+        service: http://bevox-meta-api.bevox-meta-api.svc.cluster.local:80
+        originRequest:
+          httpHostHeader: meta-api.example.com
+          connectTimeout: 10s
+          noTLSVerify: true
+      - service: http_status:404
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: bevox-meta-api
+  labels:
+    app.kubernetes.io/name: cloudflared
+    app.kubernetes.io/component: tunnel
+    bevox-meta-api/role: ingress
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflared
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudflared
+        app.kubernetes.io/component: tunnel
+        bevox-meta-api/role: ingress
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: cloudflared
+          # Pin de versão. Atualize antes de upgrades planejados e prefira
+          # digest imutável em ambientes críticos.
+          image: cloudflare/cloudflared:2026.5.2
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --config
+            - /etc/cloudflared/config/config.yaml
+            - run
+          ports:
+            - { name: metrics, containerPort: 2000 }
+          livenessProbe:
+            httpGet: { path: /ready, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/cloudflared/config, readOnly: true }
+            - { name: creds,  mountPath: /etc/cloudflared/creds,  readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: cloudflared-config }
+        - name: creds
+          secret: { secretName: cloudflared-credentials }
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloudflared
+  namespace: bevox-meta-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflared

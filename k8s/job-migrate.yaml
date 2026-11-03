@@ -1,0 +1,76 @@
+# Job one-shot pra aplicar migrations Drizzle.
+#
+# - Imagem `migrator` separada (target Dockerfile distinto de runtime).
+# - Idempotente: drizzle controla via tabela `__drizzle_migrations`.
+# - Rodar ANTES de qualquer rollout (api + workers assumem schema atualizado).
+# - Re-rodar após falha: `kubectl delete job ... && kubectl apply -f ...`
+#
+# Wiring KMS WIF (gotcha §5 do plano go-live):
+#   - serviceAccountName bevox-meta-api-kms + projected token audience
+#     `https://kubernetes.default.svc` (bate com OIDC provider em GCP).
+#   - configmap gcp-wif-credential montado em /var/secrets/gcp.
+#   - migrate em si não usa KMS, mas mantém wiring consistente com api+workers
+#     pra reduzir delta entre manifests.
+#
+# Wiring readOnlyRootFilesystem (gotcha §5):
+#   - emptyDir em /tmp (socket IPC do tsx) e /home/bevox/.cache (corepack).
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bevox-meta-api-migrate
+  namespace: bevox-meta-api
+  labels:
+    app.kubernetes.io/name: bevox-meta-api
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400 # 24h — limpa Job após sucesso
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bevox-meta-api
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: bevox-meta-api-kms
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+      containers:
+        - name: migrate
+          # Substituir tag pelo SHA do build atual (`git rev-parse --short HEAD`).
+          # imagePullPolicy: Never assume imagem importada no containerd local
+          # via `docker save | ctr -n k8s.io images import` (sem GHCR em V1).
+          image: ghcr.io/bevox/bevox-meta-api:migrator-5706afe
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef: { name: bevox-meta-api-config }
+            - secretRef: { name: bevox-meta-api-secret }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: corepack-cache, mountPath: /home/bevox/.cache }
+            - { name: gcp-wif-credential, mountPath: /var/secrets/gcp, readOnly: true }
+            - { name: gcp-tokens, mountPath: /var/run/secrets/gcp-tokens, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - { name: corepack-cache, emptyDir: {} }
+        - name: gcp-wif-credential
+          configMap: { name: gcp-wif-credential }
+        - name: gcp-tokens
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: https://kubernetes.default.svc
+                  expirationSeconds: 3600

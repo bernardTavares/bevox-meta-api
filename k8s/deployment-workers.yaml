@@ -1,0 +1,322 @@
+# 4 worker deployments (outbound dispatcher, webhook delivery, token refresh,
+# cleanup). Cada um é processo separado pra isolar falhas.
+#
+# Gotcha §1.4 do plano go-live: imagem `runtime` roda via `tsx`, NÃO via
+# `dist/`. Workers usam `node --import tsx/esm src/workers/<X>.ts`.
+#
+# Gotcha §1.5: readOnlyRootFilesystem exige emptyDir em /tmp (socket tsx) e
+# /home/bevox/.cache (corepack).
+#
+# KMS WIF idêntico ao deployment-api (workers usam tokens cifrados também:
+# outbound dispatcher decifra antes de cada call Meta; token-refresh idem).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bevox-meta-api-worker-out
+  namespace: bevox-meta-api
+  labels:
+    app.kubernetes.io/name: bevox-meta-api
+    app.kubernetes.io/component: worker-out
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bevox-meta-api
+      app.kubernetes.io/component: worker-out
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bevox-meta-api
+        app.kubernetes.io/component: worker-out
+        # A17 fix: label compartilhada (`tier=worker`) que o Service
+        # `bevox-meta-api-workers` seleciona para agrupar todos os 5 workers
+        # sob o mesmo ServiceMonitor.
+        example.com/tier: worker
+    spec:
+      serviceAccountName: bevox-meta-api-kms
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+      containers:
+        - name: worker
+          image: ghcr.io/bernardtavares/bevox-meta-api:dbe9fd6
+          imagePullPolicy: Never
+          command: ["node", "--import", "tsx/esm", "src/workers/outbound-dispatcher.ts"]
+          envFrom:
+            - configMapRef: { name: bevox-meta-api-config }
+            - secretRef: { name: bevox-meta-api-secret }
+          # A17 fix: /metrics HTTP listener (porta WORKER_METRICS_PORT).
+          # Sem esta porta, ServiceMonitor não scrape e métricas BullMQ
+          # ficavam invisíveis ao Prometheus.
+          ports:
+            - { name: metrics, containerPort: 9090, protocol: TCP }
+          resources:
+            requests: { cpu: 50m, memory: 192Mi }
+            limits: { cpu: 500m, memory: 384Mi }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: corepack-cache, mountPath: /home/bevox/.cache }
+            - { name: gcp-wif-credential, mountPath: /var/secrets/gcp, readOnly: true }
+            - { name: gcp-tokens, mountPath: /var/run/secrets/gcp-tokens, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - { name: corepack-cache, emptyDir: {} }
+        - { name: gcp-wif-credential, configMap: { name: gcp-wif-credential } }
+        - name: gcp-tokens
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: https://kubernetes.default.svc
+                  expirationSeconds: 3600
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bevox-meta-api-worker-in
+  namespace: bevox-meta-api
+  labels:
+    app.kubernetes.io/name: bevox-meta-api
+    app.kubernetes.io/component: worker-in
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bevox-meta-api
+      app.kubernetes.io/component: worker-in
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bevox-meta-api
+        app.kubernetes.io/component: worker-in
+        example.com/tier: worker
+    spec:
+      serviceAccountName: bevox-meta-api-kms
+      automountServiceAccountToken: true
+      securityContext: { runAsNonRoot: true, runAsUser: 1001, runAsGroup: 1001, fsGroup: 1001 }
+      containers:
+        - name: worker
+          image: ghcr.io/bernardtavares/bevox-meta-api:dbe9fd6
+          imagePullPolicy: Never
+          command: ["node", "--import", "tsx/esm", "src/workers/webhook-delivery.ts"]
+          envFrom:
+            - configMapRef: { name: bevox-meta-api-config }
+            - secretRef: { name: bevox-meta-api-secret }
+          ports:
+            - { name: metrics, containerPort: 9090, protocol: TCP }
+          resources:
+            requests: { cpu: 50m, memory: 192Mi }
+            limits: { cpu: 500m, memory: 384Mi }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: corepack-cache, mountPath: /home/bevox/.cache }
+            - { name: gcp-wif-credential, mountPath: /var/secrets/gcp, readOnly: true }
+            - { name: gcp-tokens, mountPath: /var/run/secrets/gcp-tokens, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - { name: corepack-cache, emptyDir: {} }
+        - { name: gcp-wif-credential, configMap: { name: gcp-wif-credential } }
+        - name: gcp-tokens
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: https://kubernetes.default.svc
+                  expirationSeconds: 3600
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bevox-meta-api-worker-tok
+  namespace: bevox-meta-api
+  labels:
+    app.kubernetes.io/name: bevox-meta-api
+    app.kubernetes.io/component: worker-tok
+spec:
+  replicas: 1 # singleton: refresh é cron periódico
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bevox-meta-api
+      app.kubernetes.io/component: worker-tok
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bevox-meta-api
+        app.kubernetes.io/component: worker-tok
+        example.com/tier: worker
+    spec:
+      serviceAccountName: bevox-meta-api-kms
+      automountServiceAccountToken: true
+      securityContext: { runAsNonRoot: true, runAsUser: 1001, runAsGroup: 1001, fsGroup: 1001 }
+      containers:
+        - name: worker
+          image: ghcr.io/bernardtavares/bevox-meta-api:dbe9fd6
+          imagePullPolicy: Never
+          command: ["node", "--import", "tsx/esm", "src/workers/token-refresh.ts"]
+          envFrom:
+            - configMapRef: { name: bevox-meta-api-config }
+            - secretRef: { name: bevox-meta-api-secret }
+          ports:
+            - { name: metrics, containerPort: 9090, protocol: TCP }
+          resources:
+            requests: { cpu: 25m, memory: 128Mi }
+            limits: { cpu: 250m, memory: 256Mi }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: corepack-cache, mountPath: /home/bevox/.cache }
+            - { name: gcp-wif-credential, mountPath: /var/secrets/gcp, readOnly: true }
+            - { name: gcp-tokens, mountPath: /var/run/secrets/gcp-tokens, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - { name: corepack-cache, emptyDir: {} }
+        - { name: gcp-wif-credential, configMap: { name: gcp-wif-credential } }
+        - name: gcp-tokens
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: https://kubernetes.default.svc
+                  expirationSeconds: 3600
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bevox-meta-api-worker-cleanup
+  namespace: bevox-meta-api
+  labels:
+    app.kubernetes.io/name: bevox-meta-api
+    app.kubernetes.io/component: worker-cleanup
+spec:
+  replicas: 1 # singleton: cron diário (3am UTC, 24h interval)
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bevox-meta-api
+      app.kubernetes.io/component: worker-cleanup
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bevox-meta-api
+        app.kubernetes.io/component: worker-cleanup
+        example.com/tier: worker
+    spec:
+      serviceAccountName: bevox-meta-api-kms
+      automountServiceAccountToken: true
+      securityContext: { runAsNonRoot: true, runAsUser: 1001, runAsGroup: 1001, fsGroup: 1001 }
+      containers:
+        - name: worker
+          image: ghcr.io/bernardtavares/bevox-meta-api:dbe9fd6
+          imagePullPolicy: Never
+          command: ["node", "--import", "tsx/esm", "src/workers/cleanup.ts"]
+          envFrom:
+            - configMapRef: { name: bevox-meta-api-config }
+            - secretRef: { name: bevox-meta-api-secret }
+          ports:
+            - { name: metrics, containerPort: 9090, protocol: TCP }
+          resources:
+            requests: { cpu: 25m, memory: 128Mi }
+            limits: { cpu: 250m, memory: 256Mi }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: corepack-cache, mountPath: /home/bevox/.cache }
+            - { name: gcp-wif-credential, mountPath: /var/secrets/gcp, readOnly: true }
+            - { name: gcp-tokens, mountPath: /var/run/secrets/gcp-tokens, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - { name: corepack-cache, emptyDir: {} }
+        - { name: gcp-wif-credential, configMap: { name: gcp-wif-credential } }
+        - name: gcp-tokens
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: https://kubernetes.default.svc
+                  expirationSeconds: 3600
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bevox-meta-api-worker-media
+  namespace: bevox-meta-api
+  labels:
+    app.kubernetes.io/name: bevox-meta-api
+    app.kubernetes.io/component: worker-media
+spec:
+  # Consumidor BullMQ standalone — produzido por inbound/service.ts a cada mensagem
+  # com mídia (audio/video/image/document). Sem este Deployment, jobs ficam órfãos
+  # no Redis até esgotar attempts; GET /v1/media/<id> devolve 202 permanentemente.
+  # Ref auditoria 2026-06-02 C2.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bevox-meta-api
+      app.kubernetes.io/component: worker-media
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bevox-meta-api
+        app.kubernetes.io/component: worker-media
+        example.com/tier: worker
+    spec:
+      serviceAccountName: bevox-meta-api-kms
+      automountServiceAccountToken: true
+      securityContext: { runAsNonRoot: true, runAsUser: 1001, runAsGroup: 1001, fsGroup: 1001 }
+      containers:
+        - name: worker
+          image: ghcr.io/bernardtavares/bevox-meta-api:dbe9fd6
+          imagePullPolicy: Never
+          command: ["node", "--import", "tsx/esm", "src/workers/media-download.ts"]
+          envFrom:
+            - configMapRef: { name: bevox-meta-api-config }
+            - secretRef: { name: bevox-meta-api-secret }
+          ports:
+            - { name: metrics, containerPort: 9090, protocol: TCP }
+          resources:
+            # Mídia até ~16MB (limite Meta) — baixa CPU, memória ligeiramente
+            # maior que outros workers (buffer durante download/upload S3).
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: corepack-cache, mountPath: /home/bevox/.cache }
+            - { name: gcp-wif-credential, mountPath: /var/secrets/gcp, readOnly: true }
+            - { name: gcp-tokens, mountPath: /var/run/secrets/gcp-tokens, readOnly: true }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - { name: corepack-cache, emptyDir: {} }
+        - { name: gcp-wif-credential, configMap: { name: gcp-wif-credential } }
+        - name: gcp-tokens
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: https://kubernetes.default.svc
+                  expirationSeconds: 3600
+      terminationGracePeriodSeconds: 30

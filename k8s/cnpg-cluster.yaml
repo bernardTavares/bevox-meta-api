@@ -1,0 +1,78 @@
+# CloudNativePG Cluster — Postgres 16 single-instance com WAL archiving e
+# ScheduledBackup pra Hetzner Object Storage (Falkenstein).
+#
+# Pré-requisitos:
+#   - Operator instalado: helm install cnpg cnpg/cloudnative-pg -n cnpg-system
+#   - Secret `cnpg-backup-creds` no ns bevox-meta-api com ACCESS_KEY_ID +
+#     ACCESS_SECRET_KEY do Hetzner Object Storage:
+#       kubectl create secret generic cnpg-backup-creds -n bevox-meta-api \
+#         --from-literal=ACCESS_KEY_ID=... \
+#         --from-literal=ACCESS_SECRET_KEY=...
+#   - Bucket `bevox-meta-api-backup` no Hetzner OS Falkenstein.
+#
+# RPO ~60s (archive_timeout); RTO minutos (restore base + WAL replay).
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: bevox-meta-api-pg
+  namespace: bevox-meta-api
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  storage:
+    size: 20Gi
+  bootstrap:
+    initdb:
+      database: bevox_meta_api
+      owner: bevox
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+      effective_cache_size: "1GB"
+      maintenance_work_mem: "64MB"
+      wal_compression: "on"
+      # WAL switch a cada 60s pra cravar RPO em ~minuto.
+      archive_timeout: "60s"
+  backup:
+    barmanObjectStore:
+      destinationPath: "s3://bevox-meta-api-backup/cnpg/"
+      endpointURL: "https://fsn1.your-objectstorage.com"
+      s3Credentials:
+        accessKeyId:
+          name: cnpg-backup-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: cnpg-backup-creds
+          key: ACCESS_SECRET_KEY
+      wal:
+        compression: gzip
+        maxParallel: 2
+      data:
+        compression: gzip
+        immediateCheckpoint: true
+    retentionPolicy: "30d"
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "1"
+  monitoring:
+    enablePodMonitor: false
+---
+# Base backup diário 02:30 UTC. WAL archiving contínuo (acima) cobre RPO entre
+# bases. PITR = base mais recente + WAL replay.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: bevox-meta-api-pg-daily
+  namespace: bevox-meta-api
+spec:
+  schedule: "0 30 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: bevox-meta-api-pg
+  method: barmanObjectStore

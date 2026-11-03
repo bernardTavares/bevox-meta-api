@@ -1,0 +1,178 @@
+# bevox-meta-api — stack para staging single-host (Debian).
+#
+# Diferenças vs docker-compose.yml (dev):
+#  - Postgres 16 + Redis 7 dedicados (NÃO compartilhar com Bevox V1).
+#  - Bind apenas 127.0.0.1 (Cloudflare Tunnel é o único ingress externo).
+#  - API escuta 3010 no host (3000 no container) — evita colisão com 3000
+#    do chat.example.com já existente no host.
+#  - Postgres em 5433 / Redis em 6380 (apenas para conexão de host se
+#    debug; entre containers usam o nome do serviço + porta interna).
+#  - Volumes named (postgres_data_meta_api, redis_data_meta_api) — sufixo
+#    p/ não pisar nos volumes do dev compose.
+#  - Restart policy: unless-stopped (reinicia em boot do host).
+#  - 5 workers: outbound, inbound, token-refresh, cleanup, media-download.
+#
+# Usar com o `.env` deste diretório (gerado fora do repo / gitignored).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bevox-meta-api-postgres-prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bevox_meta_api
+      POSTGRES_USER: bevox
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres_data_meta_api:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bevox -d bevox_meta_api"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - meta-api
+
+  redis:
+    image: redis:7-alpine
+    container_name: bevox-meta-api-redis-prod
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis_data_meta_api:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - meta-api
+
+  migrate:
+    image: bevox-meta-api:migrator-local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrator
+    container_name: bevox-meta-api-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    networks:
+      - meta-api
+    restart: "no"
+    profiles: ["migrate"] # rodar manual: docker compose --profile migrate run --rm migrate
+
+  api:
+    image: bevox-meta-api:runtime-local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: bevox-meta-api-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:3010:3000"
+    networks:
+      - meta-api
+
+  worker-out:
+    image: bevox-meta-api:runtime-local
+    container_name: bevox-meta-api-worker-out
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: ["node", "--import", "tsx/esm", "src/workers/outbound-dispatcher.ts"]
+    networks:
+      - meta-api
+
+  worker-in:
+    image: bevox-meta-api:runtime-local
+    container_name: bevox-meta-api-worker-in
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: ["node", "--import", "tsx/esm", "src/workers/webhook-delivery.ts"]
+    networks:
+      - meta-api
+
+  worker-tok:
+    image: bevox-meta-api:runtime-local
+    container_name: bevox-meta-api-worker-tok
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: ["node", "--import", "tsx/esm", "src/workers/token-refresh.ts"]
+    networks:
+      - meta-api
+
+  worker-cleanup:
+    image: bevox-meta-api:runtime-local
+    container_name: bevox-meta-api-worker-cleanup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: ["node", "--import", "tsx/esm", "src/workers/cleanup.ts"]
+    networks:
+      - meta-api
+
+  worker-media:
+    # Consumidor BullMQ standalone do queue "media-download" — produzido por
+    # src/modules/inbound/service.ts para cada mensagem com mídia
+    # (audio/video/image/document/sticker). Sem este worker, jobs ficam
+    # órfãos no Redis até esgotar attempts; GET /v1/media/<id> devolve 202
+    # permanentemente. Ref: docs/audits/runtime-gap-audit-2026-06-02.md C2.
+    image: bevox-meta-api:runtime-local
+    container_name: bevox-meta-api-worker-media
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: ["node", "--import", "tsx/esm", "src/workers/media-download.ts"]
+    networks:
+      - meta-api
+
+volumes:
+  postgres_data_meta_api:
+  redis_data_meta_api:
+
+networks:
+  meta-api:
+    name: bevox-meta-api-prod

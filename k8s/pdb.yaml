@@ -1,0 +1,38 @@
+# PodDisruptionBudget — garante zero downtime durante voluntary disruptions
+# (drain de node, rolling update, etc.).
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: bevox-meta-api
+  namespace: bevox-meta-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bevox-meta-api
+      app.kubernetes.io/component: api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: bevox-meta-api-worker-out
+  namespace: bevox-meta-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bevox-meta-api
+      app.kubernetes.io/component: worker-out
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: bevox-meta-api-worker-in
+  namespace: bevox-meta-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bevox-meta-api
+      app.kubernetes.io/component: worker-in

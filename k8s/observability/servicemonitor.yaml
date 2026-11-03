@@ -1,0 +1,50 @@
+# ServiceMonitor pro kube-prometheus-stack scraping pods do bevox-meta-api.
+#
+# A17 fix (audit 2026-06-02): adicionado `bevox-meta-api-workers` para o
+# Service headless de mesmo nome (k8s/service-workers.yaml). Antes, workers
+# tsx (outbound/webhook/token/cleanup/media) não tinham HTTP listener nem
+# Service correspondente → Prometheus não scrape e métricas BullMQ/cleanup/
+# token-refresh estavam fisicamente incoletáveis. Agora cada worker expõe
+# /metrics em :9090 (containerPort `metrics`) via worker-metrics-server.ts.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: bevox-meta-api
+  namespace: monitoring
+  labels: { release: kube-prometheus-stack }
+spec:
+  namespaceSelector:
+    matchNames: ["bevox-meta-api"]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bevox-meta-api
+      app.kubernetes.io/component: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: bevox-meta-api-workers
+  namespace: monitoring
+  labels: { release: kube-prometheus-stack }
+spec:
+  namespaceSelector:
+    matchNames: ["bevox-meta-api"]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bevox-meta-api
+      app.kubernetes.io/component: workers
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      # honorLabels=false: o pod já carrega
+      # `app.kubernetes.io/component=worker-{out,in,tok,cleanup,media}`,
+      # então cada série tem label de qual worker é. Combinado com a label
+      # `worker` interna do counter `bevox_meta_api_worker_jobs_total`,
+      # Grafana consegue split por (componente, outcome).
+      honorLabels: false

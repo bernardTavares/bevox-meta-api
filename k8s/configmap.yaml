@@ -1,0 +1,62 @@
+# ConfigMap não-sensível pro bevox-meta-api em produção (k3s Hetzner).
+#
+# Valores sensíveis (DATABASE_URL, REDIS_URL, META_*_SECRET, JWT_*, ADMIN_API_KEY,
+# WEBHOOK_DELIVERY_SIGNING_SECRET, MEDIA_S3_ACCESS_KEY/SECRET, SENTRY_DSN)
+# vivem em `bevox-meta-api-secret`, criado fora deste manifest (operacionalmente,
+# via `kubectl create secret generic --from-literal=...`, ou rotacionado por
+# runbook). Ver plano go-live §6 e CLAUDE.md §7.4.
+#
+# OTEL_EXPORTER_OTLP_ENDPOINT é endereço in-cluster (não-sensível); fica aqui
+# (não no Secret) para garantir que traces de produção saem por padrão sem
+# operator precisar preencher manualmente. Fix A18 (audit 2026-06-02):
+# anteriormente o endpoint só vivia no Secret §6 do plano go-live, e o valor
+# sugerido incluía sufixo `/v1/traces` que o exporter já acrescenta — resultado:
+# URL duplicada `/v1/traces/v1/traces` silenciando 100% dos traces em produção.
+# A telemetry agora trata os dois formatos como idênticos via
+# `resolveOtlpTracesUrl()` em src/lib/telemetry.ts.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bevox-meta-api-config
+  namespace: bevox-meta-api
+data:
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+  PORT: "3000"
+
+  # KMS: prod exige gcp (env.ts:152 bloqueia local em production).
+  # keyRing path bevox-meta-api/us-east4 provisionado em GCP project my-gcp-project.
+  # WIF cred entregue via ConfigMap gcp-wif-credential montada em /var/secrets/gcp.
+  KMS_PROVIDER: "gcp"
+  KMS_KEY_ID: "projects/my-gcp-project/locations/us-east4/keyRings/bevox-meta-api"
+  GOOGLE_APPLICATION_CREDENTIALS: "/var/secrets/gcp/wif-credential.json"
+
+  # Mídia: Hetzner Object Storage (Falkenstein). env.ts:167-187 exige https em prod.
+  MEDIA_S3_ENDPOINT: "https://fsn1.your-objectstorage.com"
+  MEDIA_S3_REGION: "fsn1"
+  MEDIA_S3_BUCKET: "bevox-meta-api-media"
+
+  # Meta
+  META_GRAPH_API_VERSION: "v21.0"
+
+  # Ingress público via Cloudflare Tunnel (k8s deploy `cloudflared`).
+  OAUTH_CALLBACK_BASE_URL: "https://meta-api.example.com"
+
+  # Observabilidade. Endpoint base (sem `/v1/traces` — o exporter acrescenta).
+  # otel-collector é deploy in-cluster (k8s/observability/), porta 4318 = OTLP/HTTP.
+  OTEL_SERVICE_NAME: "bevox-meta-api"
+  OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.monitoring.svc.cluster.local:4318"
+  # A17 fix: workers tsx expõem /metrics nessa porta — Service
+  # `bevox-meta-api-workers` + ServiceMonitor `bevox-meta-api-workers`
+  # scrape-eiam. API server ignora (usa Fastify em PORT).
+  WORKER_METRICS_PORT: "9090"
+
+  # JWT consumer
+  JWT_ISSUER: "bevox-meta-api"
+  JWT_AUDIENCE: "bevox-meta-api"
+  JWT_MAX_AGE_SECONDS: "300"
+
+  # Webhook delivery (consumers downstream)
+  WEBHOOK_DELIVERY_MAX_RETRIES: "8"

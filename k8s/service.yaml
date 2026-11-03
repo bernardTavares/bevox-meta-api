@@ -1,0 +1,19 @@
+# ClusterIP Service — apenas exposição interna (consumers do grupo Bevox).
+# Ingress externo + TLS é tratado por Ingress controller separado.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bevox-meta-api
+  namespace: bevox-meta-api
+  labels:
+    app.kubernetes.io/name: bevox-meta-api
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: bevox-meta-api
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

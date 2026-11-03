@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment": [
+    "Template para overrides locais. Copie para .claude/settings.local.json (gitignored).",
+    "Use isto para liberar permissões específicas da sua máquina sem poluir o repo.",
+    "",
+    "Exemplos úteis:",
+    "  - Liberar leitura do .env durante debug local:",
+    "      \"permissions\": { \"allow\": [\"Read(.env)\"] }",
+    "  - Permitir comandos pontuais (e.g. docker exec específico):",
+    "      \"permissions\": { \"allow\": [\"Bash(docker exec bevox-pg:*)\"] }",
+    "  - Desabilitar temporariamente um hook (renomeie o .sh, não edite aqui)."
+  ],
+  "permissions": {
+    "allow": [],
+    "deny": []
+  }
+}

@@ -1,0 +1,29 @@
+# A17 fix (audit 2026-06-02): Service ClusterIP "headless" (clusterIP: None)
+# que agrupa os 5 worker deployments (outbound, webhook-delivery, token-refresh,
+# cleanup, media-download) sob o seletor `tier=worker`. Headless porque o
+# objetivo único é dar endpoints ao ServiceMonitor para scrape de /metrics;
+# os workers não recebem tráfego do cliente (são consumidores BullMQ).
+#
+# Cada Deployment em deployment-workers.yaml expõe `containerPort: 9090`
+# como porta nominal `metrics`. O ServiceMonitor `bevox-meta-api-workers`
+# em observability/servicemonitor.yaml consome essa porta nominal.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bevox-meta-api-workers
+  namespace: bevox-meta-api
+  labels:
+    app.kubernetes.io/name: bevox-meta-api
+    app.kubernetes.io/component: workers
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: bevox-meta-api
+    example.com/tier: worker
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP

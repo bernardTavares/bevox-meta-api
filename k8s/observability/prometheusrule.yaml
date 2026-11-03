@@ -1,0 +1,58 @@
+# 6 alertas pro bevox-meta-api (P1 critical, P2 warning, P3 info).
+# Alertmanager rotea conforme severity label.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: bevox-meta-api-alerts
+  namespace: monitoring
+  labels: { release: kube-prometheus-stack }
+spec:
+  groups:
+    - name: bevox-meta-api
+      rules:
+        - alert: MetaApiNoReadyReplicas
+          expr: kube_deployment_status_replicas_available{namespace="bevox-meta-api",deployment="bevox-meta-api"} == 0
+          for: 5m
+          labels: { severity: critical, priority: P1 }
+          annotations:
+            summary: "bevox-meta-api sem réplicas prontas (/readyz down) >5min"
+
+        - alert: MetaApiHigh5xxRate
+          expr: |
+            sum(rate(bevox_meta_api_http_requests_total{status_code=~"5.."}[10m]))
+            / clamp_min(sum(rate(bevox_meta_api_http_requests_total[10m])), 1) > 0.05
+          for: 10m
+          labels: { severity: critical, priority: P1 }
+          annotations:
+            summary: "HTTP 5xx > 5% por 10min"
+
+        - alert: MetaApiMetaLatencyP99
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(bevox_meta_api_meta_request_duration_seconds_bucket[15m]))) > 5
+          for: 15m
+          labels: { severity: warning, priority: P2 }
+          annotations:
+            summary: "Meta latency p99 > 5s por 15min"
+
+        - alert: MetaApiDeadLetterGrowing
+          expr: increase(bevox_meta_api_webhook_delivery_total{outcome="dead_letter"}[10m]) > 0
+          for: 10m
+          labels: { severity: warning, priority: P2 }
+          annotations:
+            summary: "Webhook dead-letter crescendo"
+
+        - alert: MetaApiTokenDisconnected
+          expr: increase(bevox_meta_api_token_refresh_total{outcome="disconnected"}[15m]) > 0
+          for: 1m
+          labels: { severity: warning, priority: P2 }
+          annotations:
+            summary: "Token refresh disconnected — consumer impactado"
+
+        - alert: MetaApiCleanupWorkerDown
+          expr: kube_deployment_status_replicas_available{namespace="bevox-meta-api",deployment="bevox-meta-api-worker-cleanup"} == 0
+          for: 30m
+          labels: { severity: info, priority: P3 }
+          annotations:
+            summary: "cleanup worker indisponível (risco de retenção não aplicada)"
