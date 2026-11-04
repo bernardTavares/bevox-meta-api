@@ -1,10 +1,16 @@
 # Bevox Meta API
 
+[![tests](https://img.shields.io/badge/tests-443%20unit%20%2B%209%20integration-brightgreen)](#) [![license](https://img.shields.io/badge/license-FSL--1.1--MIT-blue)](./LICENSE.md) ![language](https://img.shields.io/github/languages/top/bernardTavares/bevox-meta-api) ![status](https://img.shields.io/badge/status-ran%20in%20production-orange)
+
+![bevox-meta-api](docs/assets/social-card.png)
+
+> Part of the [4-layer AI-first company series](https://github.com/bernardTavares). License: FSL-1.1-MIT (source-available, converts to MIT after 2 years)
+
 A multi-tenant HTTP gateway over Meta's **WhatsApp Cloud API** and **Instagram Graph API**. Any number of consumer apps get one surface for onboarding business numbers, sending messages, receiving webhooks and managing tokens, templates and rate limits. They never touch Meta's API directly.
 
-It was the messaging layer of **Bevox**, an AI secretary for appointment-based businesses on WhatsApp and Instagram, built by one person in 2026.
+It is the messaging layer of **Bevox**, an AI secretary for appointment-based businesses on WhatsApp and Instagram, built by one person in 2026.
 
-> **Status: ran in production.** V1 went live on 2026-05-27 on a single-node k3s cluster (Hetzner, arm64) and served Bevox's own two consumer apps (2026-05-27 to 2026-06-22). Treat it as a reference implementation of a Meta messaging gateway and its operations, not as a supported product.
+> **Status: ran in production.** V1 went live on 2026-05-27 on a single-node k3s cluster (Hetzner, arm64) and served Bevox's own two consumer apps. Treat it as a reference implementation of a Meta messaging gateway and its operations, not as a supported product.
 
 ## Why a gateway
 
