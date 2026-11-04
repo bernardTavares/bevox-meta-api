@@ -4,7 +4,7 @@ A multi-tenant HTTP gateway over Meta's **WhatsApp Cloud API** and **Instagram G
 
 It was the messaging layer of **Bevox**, an AI secretary for appointment-based businesses on WhatsApp and Instagram, built by one person in 2026.
 
-> **Status: ran in production.** V1 went live on 2026-05-27 on a single-node k3s cluster (Hetzner, arm64) and served Bevox's own two consumer apps. Development stopped on 2026-06-22 when the product stopped. Treat it as a reference implementation of a Meta messaging gateway and its operations, not as a supported product.
+> **Status: ran in production.** V1 went live on 2026-05-27 on a single-node k3s cluster (Hetzner, arm64) and served Bevox's own two consumer apps (2026-05-27 to 2026-06-22). Treat it as a reference implementation of a Meta messaging gateway and its operations, not as a supported product.
 
 ## Why a gateway
 
